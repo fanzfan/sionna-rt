@@ -306,14 +306,13 @@ class FieldCalculator:
             # If a diffuse reflection is sampled, then it is set to 2PI.
             # Otherwise it is left unchanged
             solid_angle = dr.select(diffuse, dr.two_pi, solid_angle)
-
+            ki_world = dr.select(active, ko_world, ki_world)
             # Prepare for next iteration
             depth += 1
             active &= (depth <= max_depth) & ~next_is_none
             normal = dr.copy(si_scene.n)
             prev_vertex = dr.copy(vertex)
             vertex = dr.copy(next_vertex)
-            ki_world = dr.select(active, ko_world, ki_world)
             interaction_type = dr.copy(next_interaction_type)
 
         # Scaling to apply free-space propagation loss
