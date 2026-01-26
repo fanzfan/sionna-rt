@@ -388,8 +388,9 @@ class Previewer:
                     ends.append(tgt_positions[rx])
                     colors.append(color)
 
-        self._plot_lines(np.vstack(starts), np.vstack(ends),
-                         np.vstack(colors), line_width)
+        if starts:
+            self._plot_lines(np.vstack(starts), np.vstack(ends),
+                             np.vstack(colors), line_width)
         self._add_legend(category="paths")
 
     def plot_planar_radio_map(self, radio_map, tx=0, db_scale=True,
