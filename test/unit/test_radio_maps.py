@@ -799,3 +799,106 @@ def test_show_association(color_map):
         scene.render_to_file(camera=to_world, filename=fname, radio_map=rm,
                              clip_at=0.5 * bbox.max.z)
         print(f"Saved rendering to: {fname}")
+
+
+def test_batch_precoding():
+    """Test that batch precoding produces results consistent with single-beam calls
+    and that different beams produce different radio maps."""
+
+    scene = load_scene(rt.scene.simple_reflector, merge_shapes=False)
+
+    # Configure antenna array with multiple antennas for meaningful precoding
+    scene.tx_array = PlanarArray(num_rows=2,
+                                 num_cols=2,
+                                 vertical_spacing=0.5,
+                                 horizontal_spacing=0.5,
+                                 pattern="iso",
+                                 polarization="V")
+
+    # Add a transmitter
+    tx = Transmitter(name="tx",
+                     position=mi.Point3f(0, 0, 0.1),
+                     orientation=mi.Point3f(0, 0, 0))
+    scene.add(tx)
+
+    # Create multiple precoding vectors (2 beams)
+    num_tx = 1
+    num_tx_ant = 4
+
+    # Beam 1: uniform weighting
+    pv1_real = dr.ones(mi.TensorXf, [num_tx, num_tx_ant]) / dr.sqrt(num_tx_ant)
+    pv1_imag = dr.zeros(mi.TensorXf, [num_tx, num_tx_ant])
+
+    # Beam 2: different phase (flip one antenna's phase)
+    pv2_real = dr.ones(mi.TensorXf, [num_tx, num_tx_ant]) / dr.sqrt(num_tx_ant)
+    pv2_real.array[2] *= -1  # Flip phase of one antenna
+    pv2_imag = dr.zeros(mi.TensorXf, [num_tx, num_tx_ant])
+
+    # Test batch precoding vectors
+    batch_precoding_vecs = [
+        (pv1_real, pv1_imag),
+        (pv2_real, pv2_imag),
+    ]
+
+    rm_solver = RadioMapSolver()
+
+    # Compute radio maps using batch mode
+    radio_maps_batch = rm_solver(scene,
+                                 cell_size=mi.Point2f(1, 1),
+                                 center=mi.Point3f(0, 0, 1),
+                                 orientation=mi.Point3f(0., 0., 0.),
+                                 size=mi.Point2f(3, 3),
+                                 samples_per_tx=int(1e6),
+                                 max_depth=1,
+                                 los=True,
+                                 precoding_vec=batch_precoding_vecs,
+                                 seed=42)
+
+    # Test that batch mode returns a list
+    assert isinstance(radio_maps_batch, list)
+    assert len(radio_maps_batch) == 2
+
+    # Compute individual radio maps for comparison
+    rm1_single = rm_solver(scene,
+                           cell_size=mi.Point2f(1, 1),
+                           center=mi.Point3f(0, 0, 1),
+                           orientation=mi.Point3f(0., 0., 0.),
+                           size=mi.Point2f(3, 3),
+                           samples_per_tx=int(1e6),
+                           max_depth=1,
+                           los=True,
+                           precoding_vec=(pv1_real, pv1_imag),
+                           seed=42)
+
+    rm2_single = rm_solver(scene,
+                           cell_size=mi.Point2f(1, 1),
+                           center=mi.Point3f(0, 0, 1),
+                           orientation=mi.Point3f(0., 0., 0.),
+                           size=mi.Point2f(3, 3),
+                           samples_per_tx=int(1e6),
+                           max_depth=1,
+                           los=True,
+                           precoding_vec=(pv2_real, pv2_imag),
+                           seed=42)
+
+    # Test that single mode returns a single RadioMap (not a list)
+    assert not isinstance(rm1_single, list)
+    assert not isinstance(rm2_single, list)
+
+    # Compare batch vs single mode results
+    pg_batch_0 = radio_maps_batch[0].path_gain.numpy()
+    pg_batch_1 = radio_maps_batch[1].path_gain.numpy()
+    pg_single_1 = rm1_single.path_gain.numpy()
+    pg_single_2 = rm2_single.path_gain.numpy()
+
+    # Results should be very close (within numerical precision)
+    max_rel_diff_1 = np.max(np.abs(pg_batch_0 - pg_single_1) / (pg_single_1 + 1e-30))
+    max_rel_diff_2 = np.max(np.abs(pg_batch_1 - pg_single_2) / (pg_single_2 + 1e-30))
+
+    assert max_rel_diff_1 < 1e-5, f"Batch beam 1 differs from single beam 1: {max_rel_diff_1}"
+    assert max_rel_diff_2 < 1e-5, f"Batch beam 2 differs from single beam 2: {max_rel_diff_2}"
+
+    # Different beams should produce different results
+    # (at least some difference due to different precoding)
+    max_abs_diff_beams = np.max(np.abs(pg_batch_0 - pg_batch_1))
+    assert max_abs_diff_beams > 0, "Different beams should produce different results"

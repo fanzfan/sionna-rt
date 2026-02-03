@@ -6,7 +6,7 @@
 
 import mitsuba as mi
 import drjit as dr
-from typing import Tuple, Callable, List
+from typing import Tuple, Callable, List, Union
 
 from sionna.rt.utils import spawn_ray_from_sources, fibonacci_lattice,\
     rotation_matrix, spectrum_to_matrix_4f, WedgeGeometry,\
@@ -227,7 +227,11 @@ class RadioMapSolver:
         size: mi.Point2f | None = None,
         cell_size: mi.Point2f = mi.Point2f(10, 10),
         measurement_surface: mi.Shape | SceneObject | None = None,
-        precoding_vec: Tuple[mi.TensorXf, mi.TensorXf] | None = None,
+        precoding_vec: Union[
+            Tuple[mi.TensorXf, mi.TensorXf],
+            List[Tuple[mi.TensorXf, mi.TensorXf]],
+            None
+        ] = None,
         samples_per_tx: int = 1000000,
         max_depth: int = 3,
         los: bool = True,
@@ -241,7 +245,7 @@ class RadioMapSolver:
         rr_depth: int = -1,
         rr_prob: float = 0.95,
         stop_threshold: float | None = None
-    ) -> RadioMap:
+    ) -> Union[RadioMap, List[RadioMap]]:
         # pylint: disable=line-too-long
         r"""
         Executes the solver
@@ -275,7 +279,12 @@ class RadioMapSolver:
             If set to `None`, then the radio map is computed for a measurement
             grid defined by ``center``, ``orientation``, ``size``, and ``cell_size``.
         :param precoding_vec: Real and imaginary components of the
-            complex-valued precoding vector.
+            complex-valued precoding vector(s).
+            Can be a single tuple ``(real, imag)`` for one beam, or a list of
+            such tuples ``[(real1, imag1), (real2, imag2), ...]`` for multiple
+            beams. When multiple beams are provided, ray tracing is performed
+            once and the precoding is applied for each beam, significantly
+            improving efficiency for multi-beam scenarios.
             If set to `None`, then defaults to
             :math:`\frac{1}{\sqrt{\text{num_tx_ant}}} [1,\dots,1]^{\mathsf{T}}`.
         :param samples_per_tx: Number of samples per source
@@ -294,21 +303,49 @@ class RadioMapSolver:
         :param stop_threshold: Gain threshold [dB] below which a path is
             deactivated
 
-        :return: Computed radio map
+        :return: Computed radio map (or list of radio maps if multiple
+            precoding vectors are provided)
         """
 
         # Check that the scene is all set for simulations
         scene.all_set(radio_map=True)
 
-        # Check and initialize the precoding vector
+        # Check and initialize the precoding vector(s)
         num_tx = len(scene.transmitters)
         num_tx_ant = scene.tx_array.num_ant
+
+        # Determine if we have batch precoding vectors (list of tuples)
+        is_batch = isinstance(precoding_vec, list)
+
         if precoding_vec is None:
+            # Default precoding vector
             precoding_vec_real = dr.ones(mi.TensorXf, [num_tx, num_tx_ant])
             precoding_vec_real /= dr.sqrt(scene.tx_array.num_ant)
             precoding_vec_imag = dr.zeros(mi.TensorXf, [num_tx, num_tx_ant])
-            precoding_vec = (precoding_vec_real, precoding_vec_imag)
+            precoding_vecs = [(precoding_vec_real, precoding_vec_imag)]
+        elif is_batch:
+            # List of precoding vectors for batch processing
+            precoding_vecs = []
+            for pv in precoding_vec:
+                pv_real, pv_imag = pv
+                if not isinstance(pv_real, type(pv_imag)):
+                    raise TypeError("The real and imaginary components of "\
+                                    "`precoding_vec` must be of the same type")
+                # Normalize single vector to per-transmitter format
+                if ( isinstance(pv_real, mi.Float) or
+                    (isinstance(pv_real, mi.TensorXf)
+                     and len(dr.shape(pv_real)) == 1) ):
+                    pv_real = mi.Float(pv_real)
+                    pv_imag = mi.Float(pv_imag)
+                    pv_real = dr.tile(pv_real, num_tx)
+                    pv_imag = dr.tile(pv_imag, num_tx)
+                    pv_real = dr.reshape(mi.TensorXf, pv_real,
+                                         [num_tx, num_tx_ant])
+                    pv_imag = dr.reshape(mi.TensorXf, pv_imag,
+                                         [num_tx, num_tx_ant])
+                precoding_vecs.append((pv_real, pv_imag))
         else:
+            # Single precoding vector (original behavior)
             precoding_vec_real, precoding_vec_imag = precoding_vec
             if not isinstance(precoding_vec_real, type(precoding_vec_imag)):
                 raise TypeError("The real and imaginary components of "\
@@ -328,7 +365,10 @@ class RadioMapSolver:
                                                 [num_tx, num_tx_ant])
                 precoding_vec_imag = dr.reshape(mi.TensorXf, precoding_vec_imag,
                                                 [num_tx, num_tx_ant])
-                precoding_vec = (precoding_vec_real, precoding_vec_imag)
+            precoding_vecs = [(precoding_vec_real, precoding_vec_imag)]
+
+        # Number of beams (precoding vectors)
+        num_beams = len(precoding_vecs)
 
         # Transmitter configurations
         # Generates sources positions and orientations
@@ -356,7 +396,7 @@ class RadioMapSolver:
         # Set the seed of the sampler
         self._sampler.seed(seed, num_samples)
 
-        # Build Radio Map instance
+        # Build Radio Map instances - one for each beam
         # If a measurement surface is provided, then it is a mesh radio map.
         # Moreover, in this case, the Mitsuba scene is modified by adding the
         # measurement surface to the scene.
@@ -364,23 +404,25 @@ class RadioMapSolver:
             if isinstance(measurement_surface, SceneObject):
                 measurement_surface = measurement_surface.mi_mesh
             modified_scene = extend_scene_with_mesh(scene.mi_scene, measurement_surface)
-            radio_map = MeshRadioMap(scene, measurement_surface)
+            radio_maps = [MeshRadioMap(scene, measurement_surface)
+                          for _ in range(num_beams)]
         else:
             modified_scene = scene.mi_scene
-            radio_map = PlanarRadioMap(scene, cell_size, center, orientation, size)
+            radio_maps = [PlanarRadioMap(scene, cell_size, center, orientation, size)
+                          for _ in range(num_beams)]
 
         # Computes the pathloss map (except for diffraction)
-        # `radio_map` is updated in-place.
+        # Radio maps are updated in-place.
         # This flag is set to avoid tracing the loops twice, which adds
         # a fairly significant CPU overhead.
         with dr.scoped_set_flag(dr.JitFlag.OptimizeLoops, False):
             with scene.use_mi_scene(modified_scene):
                 wedges, wedges_counter = self._shoot_and_bounce(
-                    scene, radio_map,
+                    scene, radio_maps,
                     self._sampler,
                     tx_positions, tx_orientations,
                     tx_antenna_patterns,
-                    precoding_vec, rel_ant_positions_tx,
+                    precoding_vecs, rel_ant_positions_tx,
                     samples_per_tx, max_depth,
                     los,
                     specular_reflection,
@@ -392,19 +434,19 @@ class RadioMapSolver:
                 )
 
                 # Add the contribution of diffracted paths to
-                # the radio map
+                # the radio maps
                 if diffraction and max_depth > 0 and wedges_counter > 0:
                     # Reseting the seed of the sampler to ensure its state
                     # was scheduled
                     self._sampler.seed(seed + 1 , num_samples)
                     self._evaluate_first_order_diffraction(
                         scene,
-                        radio_map,
+                        radio_maps,
                         self._sampler,
                         tx_positions,
                         tx_orientations,
                         tx_antenna_patterns,
-                        precoding_vec,
+                        precoding_vecs,
                         rel_ant_positions_tx,
                         samples_per_tx,
                         wedges,
@@ -412,22 +454,27 @@ class RadioMapSolver:
                     )
 
         # Finalizes the computation of the radio maps
-        radio_map.finalize()
+        for radio_map in radio_maps:
+            radio_map.finalize()
 
-        return radio_map
+        # Return single radio map or list depending on input
+        if is_batch:
+            return radio_maps
+        else:
+            return radio_maps[0]
 
     # pylint: disable=line-too-long
     @dr.syntax
     def _shoot_and_bounce(
         self,
         scene: Scene,
-        radio_map: RadioMap,
+        radio_maps: List[RadioMap],
         sampler: mi.Sampler,
         tx_positions: mi.Point3f,
         tx_orientations: mi.Point3f,
         tx_antenna_patterns: List[Callable[[mi.Float, mi.Float],
                                             Tuple[mi.Complex2f, mi.Complex2f]]],
-        precoding_vec: Tuple[mi.TensorXf, mi.TensorXf],
+        precoding_vecs: List[Tuple[mi.TensorXf, mi.TensorXf]],
         rel_ant_positions_tx: mi.Point3f,
         samples_per_tx: int,
         max_depth: int,
@@ -444,16 +491,16 @@ class RadioMapSolver:
         r"""
         Executes the shoot-and-bounce loop
 
-        The ``radio_map`` is updated in-place.
+        The radio maps are updated in-place.
 
         :param scene: Scene for which to compute the radio map
-        :param radio_map: Radio map
+        :param radio_maps: List of radio maps, one per beam
         :param sampler: Sampler used to generate random numbers and vectors
         :param tx_positions: Positions of the transmitters
         :param tx_orientations: Orientations of the transmitters
         :param tx_antenna_patterns: Antenna pattern of the transmitters
-        :param precoding_vec: Real and imaginary components of the
-            complex-valued precoding vector
+        :param precoding_vecs: List of precoding vectors (real, imag) tuples,
+            one per beam
         :param rel_ant_positions_tx: Positions of the antenna elements relative
             to the transmitters positions
         :param samples_per_tx: Number of samples per source
@@ -481,6 +528,10 @@ class RadioMapSolver:
         num_txs = dr.shape(tx_positions)[1]
         num_samples = samples_per_tx * num_txs
         num_tx_ant_patterns = len(tx_antenna_patterns)
+        num_beams = len(precoding_vecs)
+
+        # Use first radio map for measurement surface (all have the same)
+        radio_map = radio_maps[0]
 
         tx_indices = dr.repeat(dr.arange(mi.UInt, num_txs), samples_per_tx)
 
@@ -488,10 +539,11 @@ class RadioMapSolver:
         ray = spawn_ray_from_sources(fibonacci_lattice, samples_per_tx,
                                      tx_positions)
 
-        # Weights to account for the antenna array and precoding
-        array_w = self._synthetic_array_weighting(scene, ray.d,
-                                                  rel_ant_positions_tx,
-                                                  precoding_vec)
+        # Weights to account for the antenna array and precoding - one per beam
+        array_ws = [self._synthetic_array_weighting(scene, ray.d,
+                                                    rel_ant_positions_tx,
+                                                    precoding_vec)
+                    for precoding_vec in precoding_vecs]
 
         # Mask indicating which rays are active
         active = dr.full(dr.mask_t(mi.Float), True, num_samples)
@@ -553,11 +605,12 @@ class RadioMapSolver:
 
         depth = mi.UInt(0)
         while dr.hint(active, mode=self.loop_mode, exclude=[
-                          array_w, tx_positions, edge_diffraction_enabled,
+                          array_ws, tx_positions, edge_diffraction_enabled,
                           enabled_interactions, los_enabled, max_depth,
                           next_wedge_ind, num_hashes, num_tx_ant_patterns,
-                          radio_map, rr_depth, rr_prob, scene, self,
-                          stop_threshold, tx_indices, wedges, wedges_counter
+                          radio_map, radio_maps, num_beams, rr_depth, rr_prob,
+                          scene, self, stop_threshold, tx_indices, wedges,
+                          wedges_counter
                       ]):
 
             # Test intersection with the scene
@@ -610,20 +663,21 @@ class RadioMapSolver:
                 mp_int = active & si_mp.is_valid() \
                          & (si_mp.shape == radio_map.measurement_surface)
 
-            # Update the radio map
+            # Update the radio maps for all beams
             # The radio map is not updated if LoS is disabled and it is a
             # LoS interaction with the measurement surface
             # Note that we need to redo the LoS test to handle the case where
             # the measurement surface is part of the scene
             update_radio_map = mp_int & ((depth > 0) | los_enabled)
-            radio_map.add_paths(e_fields,
-                                array_w,
-                                si_mp,
-                                ray.d,
-                                tx_indices,
-                                update_radio_map,
-                                False,
-                                solid_angle)
+            for beam_idx in range(num_beams):
+                radio_maps[beam_idx].add_paths(e_fields,
+                                               array_ws[beam_idx],
+                                               si_mp,
+                                               ray.d,
+                                               tx_indices,
+                                               update_radio_map,
+                                               False,
+                                               solid_angle)
 
             # Update the active state of rays
             # Active if has hit the scene (which includes the measurement surface
@@ -695,34 +749,36 @@ class RadioMapSolver:
     def _evaluate_first_order_diffraction(
         self,
         scene: Scene,
-        radio_map: RadioMap,
+        radio_maps: List[RadioMap],
         sampler: mi.Sampler,
         tx_positions: mi.Point3f,
         tx_orientations: mi.Point3f,
         tx_antenna_patterns: List[Callable[[mi.Float, mi.Float],
                                             Tuple[mi.Complex2f, mi.Complex2f]]],
-        precoding_vec: Tuple[mi.TensorXf, mi.TensorXf],
+        precoding_vecs: List[Tuple[mi.TensorXf, mi.TensorXf]],
         rel_ant_positions_tx: mi.Point3f,
         samples_per_tx: int,
         wedges: WedgeGeometry,
         diffraction_lit_region: bool):
         """
         Traces first-order diffracted paths for a set of `wedges` and adds their
-        contributions to the radio map
+        contributions to the radio maps
 
         This method computes the electric field contributions from rays that undergo
         first-order diffraction at wedges in the scene. It samples diffraction points
         along the wedges and evaluates the diffracted field.
         If paths intersect with the measurement surface, then their contributions
-        are added to the radio map. Wedges are sampled proportionally to their length.
+        are added to the radio maps. Wedges are sampled proportionally to their length.
 
         :param scene: Scene containing the geometry and material properties
-        :param radio_map: Radio map object to be updated with diffraction contributions
+        :param radio_maps: List of radio map objects to be updated with diffraction
+            contributions, one per beam
         :param sampler: Sampler for generating random numbers
         :param tx_positions: Positions of all transmitters in the scene
         :param tx_orientations: Orientations of all transmitters in the scene
         :param tx_antenna_patterns: List of antenna pattern functions for each transmitter
-        :param precoding_vec: Precoding vectors for transmitter arrays
+        :param precoding_vecs: List of precoding vectors (real, imag) tuples for
+            transmitter arrays, one per beam
         :param rel_ant_positions_tx: Relative positions of antenna elements in transmitter arrays
         :param samples_per_tx: Number of samples to generate per transmitter
         :param wedges: Geometry information for all wedges in the scene
@@ -730,6 +786,10 @@ class RadioMapSolver:
         """
         num_txs = dr.shape(tx_positions)[1]
         num_samples = num_txs * samples_per_tx
+        num_beams = len(precoding_vecs)
+
+        # Use first radio map for measurement surface (all have the same)
+        radio_map = radio_maps[0]
         is_planar_radio_map = isinstance(radio_map, PlanarRadioMap)
 
         #############################################################
@@ -778,10 +838,11 @@ class RadioMapSolver:
         # Initialize the electric field and array weighting
         #############################################################
 
-        # Weights to account for the antenna array and precoding
-        array_w = self._synthetic_array_weighting(scene, ki,
-                                                  rel_ant_positions_tx,
-                                                  precoding_vec)
+        # Weights to account for the antenna array and precoding - one per beam
+        array_ws = [self._synthetic_array_weighting(scene, ki,
+                                                    rel_ant_positions_tx,
+                                                    precoding_vec)
+                    for precoding_vec in precoding_vecs]
 
         # Initialize the electric field
         # Orientation of sources and targets and correspond to-world transforms
@@ -839,7 +900,8 @@ class RadioMapSolver:
         # For mesh-based radio maps, handle potential multiple
         # intersections with the measurement surface
         while dr.hint(valid_path, mode=self.loop_mode,
-                      exclude=[array_w, tx_positions]):
+                      exclude=[array_ws, tx_positions, radio_map, radio_maps,
+                               num_beams]):
 
             # Test intersection with the measurement
             # surface, and ensure that the segment from the
@@ -897,19 +959,20 @@ class RadioMapSolver:
                 s, s_prime, add_to_rm
             )
 
-            # Add contribution to the radio map
-            radio_map.add_paths(e_fields,
-                                array_w,
-                                si_mp,
-                                ko,
-                                tx_indices,
-                                add_to_rm,
-                                True,
-                                None,
-                                tx_positions,
-                                sampled_wedges,
-                                diff_point,
-                                samples_per_wedge)
+            # Add contribution to the radio maps for all beams
+            for beam_idx in range(num_beams):
+                radio_maps[beam_idx].add_paths(e_fields,
+                                               array_ws[beam_idx],
+                                               si_mp,
+                                               ko,
+                                               tx_indices,
+                                               add_to_rm,
+                                               True,
+                                               None,
+                                               tx_positions,
+                                               sampled_wedges,
+                                               diff_point,
+                                               samples_per_wedge)
 
             # Spawn new rays
             ray_mp = si_mp.spawn_ray(ko)
