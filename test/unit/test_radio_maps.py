@@ -830,8 +830,11 @@ def test_batch_precoding():
     pv1_imag = dr.zeros(mi.TensorXf, [num_tx, num_tx_ant])
 
     # Beam 2: different phase (flip one antenna's phase)
-    pv2_real = dr.ones(mi.TensorXf, [num_tx, num_tx_ant]) / dr.sqrt(num_tx_ant)
-    pv2_real.array[2] *= -1  # Flip phase of one antenna
+    # Create a weight array with one element flipped
+    weights = mi.TensorXf([1.0, 1.0, -1.0, 1.0])  # Flip third element
+    pv2_real = dr.reshape(mi.TensorXf,
+                          weights.array / dr.sqrt(num_tx_ant),
+                          [num_tx, num_tx_ant])
     pv2_imag = dr.zeros(mi.TensorXf, [num_tx, num_tx_ant])
 
     # Test batch precoding vectors
