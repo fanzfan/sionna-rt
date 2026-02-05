@@ -112,8 +112,12 @@ class SampleData:
         shapes = dr.reinterpret_array(mi.UInt, shapes)
 
         # Store data in the buffer
-        data = SampleData.SampleDataFields(interaction_types, shapes,
-                                           primitives, vertices, probs)
+        data = SampleData.SampleDataFields(dr.detach(interaction_types), 
+                                           dr.detach(shapes),
+                                           dr.detach(primitives),
+                                           dr.detach(vertices), 
+                                           dr.detach(probs))
+        
         self._local_mem.write(data, index, active=active)
 
         # Store the local edge index and edge properties

@@ -117,7 +117,7 @@ where
                    -\hat{k}_y &  \hat{k}_x &          0
                  \end{bmatrix}\\
     \hat{\mathbf{k}} &= \frac{\hat{\mathbf{a}} \times \hat{\mathbf{b}}}{\lVert \hat{\mathbf{a}} \times \hat{\mathbf{b}} \rVert}\\
-    \theta &=\hat{\mathbf{a}}^\mathsf{T}\hat{\mathbf{b}}
+    \cos\(\theta\) &=\hat{\mathbf{a}}^\mathsf{T}\hat{\mathbf{b}}
 
 such that :math:`\mathbf{R}(\hat{\mathbf{a}}, \hat{\mathbf{b}})\hat{\mathbf{a}}=\hat{\mathbf{b}}`.
 
