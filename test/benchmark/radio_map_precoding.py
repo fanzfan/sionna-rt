@@ -87,10 +87,25 @@ def run(mode, precoding_vecs, samples_per_tx, seed):
                for v in range(dr.shape(real)[0])]
     else:
         rms = solver(scene, precoding_vec=precoding_vecs, **kwargs)
-    for rm in rms:
-        dr.eval(rm.path_gain)
+    # Return only the gains so each run releases its measurement surfaces.
+    # Keeping those surfaces alive changes the shape IDs in later JIT kernels.
+    path_gains = [rm.path_gain for rm in rms]
+    for gain in path_gains:
+        dr.eval(gain)
     dr.sync_thread()
-    return time.perf_counter() - t0, rms
+    return time.perf_counter() - t0, path_gains
+
+
+def time_pair(precoding_vecs, samples_per_tx, seed):
+    """Time both modes, retrying the pair if either warms the JIT cache."""
+    for _ in range(2):
+        # The last two counters track disk-cache loads and new compilations.
+        misses = dr.detail.launch_stats()[1:]
+        t_sep = run("separate", precoding_vecs, samples_per_tx, seed)[0]
+        t_bat = run("batched", precoding_vecs, samples_per_tx, seed)[0]
+        if dr.detail.launch_stats()[1:] == misses:
+            return t_sep, t_bat
+    raise RuntimeError("Repeated timing pair still incurred JIT cache misses")
 
 
 def main():
@@ -103,22 +118,23 @@ def main():
         precoding_vecs = codebook(num_vecs)
         for samples_per_tx in args.samples_per_tx or [1e6, 1e7, 1e8, 1e9]:
             # JIT compilation and correctness check
-            _, rms_sep = run("separate", precoding_vecs, samples_per_tx, 1)
-            _, rms_bat = run("batched", precoding_vecs, samples_per_tx, 1)
-            pg_sep = np.stack([rm.path_gain.numpy() for rm in rms_sep])
-            pg_bat = np.stack([rm.path_gain.numpy() for rm in rms_bat])
+            _, gains_sep = run("separate", precoding_vecs, samples_per_tx, 1)
+            _, gains_bat = run("batched", precoding_vecs, samples_per_tx, 1)
+            pg_sep = np.stack([gain.numpy() for gain in gains_sep])
+            pg_bat = np.stack([gain.numpy() for gain in gains_bat])
             err = np.max(np.abs(pg_sep - pg_bat)) / np.max(pg_sep)
             # GPU warm-up
-            t_end = time.time() + args.warmup
-            while time.time() < t_end:
+            t_end = time.perf_counter() + args.warmup
+            while time.perf_counter() < t_end:
+                run("separate", precoding_vecs, samples_per_tx, 2)
                 run("batched", precoding_vecs, samples_per_tx, 2)
-            times = {"separate": [], "batched": []}
+            separate_times, batched_times = [], []
             for r in range(args.rounds):
-                for mode, ts in times.items():
-                    t, _ = run(mode, precoding_vecs, samples_per_tx, 10 + r)
-                    ts.append(t)
-            t_sep = statistics.median(times["separate"])
-            t_bat = statistics.median(times["batched"])
+                t_sep, t_bat = time_pair(precoding_vecs, samples_per_tx, 10 + r)
+                separate_times.append(t_sep)
+                batched_times.append(t_bat)
+            t_sep = statistics.median(separate_times)
+            t_bat = statistics.median(batched_times)
             print(f"{samples_per_tx:8.0e} {num_vecs:4d} | {t_sep:12.3f} "
                   f"{t_bat:12.3f} {t_sep / t_bat:7.2f}x | {err:13.1e}",
                   flush=True)

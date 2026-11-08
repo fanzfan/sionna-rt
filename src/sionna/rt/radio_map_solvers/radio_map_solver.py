@@ -1146,7 +1146,7 @@ class RadioMapSolver:
             raise ValueError("Each precoding vector must be a pair "
                              "(real, imag)")
         real, imag = precoding_vec
-        if not isinstance(real, type(imag)):
+        if not isinstance(imag, type(real)):
             raise TypeError("The real and imaginary components of "
                             "`precoding_vec` must be of the same type")
 
@@ -1157,6 +1157,9 @@ class RadioMapSolver:
             # storage out of the tensor, which would leave the caller's tensor
             # empty.
             if isinstance(real, mi.TensorXf):
+                if real.shape != imag.shape:
+                    raise ValueError("The real and imaginary components of "
+                                     "`precoding_vec` must have the same shape")
                 real, imag = real.array, imag.array
             if dr.width(real) != num_tx_ant or dr.width(imag) != num_tx_ant:
                 raise ValueError(

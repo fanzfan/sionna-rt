@@ -171,7 +171,6 @@ class RadioMap(ABC):
 
         self._scatter_path_gain(a * w, tensor_ind, active)
 
-    @abstractmethod
     def _path_weight(
         self,
         si: mi.SurfaceInteraction3f,
@@ -190,6 +189,8 @@ class RadioMap(ABC):
         r"""
         Computes where and with which weight the paths that hit the
         measurement surface contribute to the path gain map
+
+        Subclasses that use the default :meth:`add_paths` implement this hook.
 
         The contribution of a path is the squared norm of its (precoded)
         electric field multiplied by the returned weight. The weight only
@@ -220,7 +221,7 @@ class RadioMap(ABC):
         :return: Indices of the updated entries of the path gain map, weights,
             and flags indicating which paths contribute
         """
-        raise NotImplementedError("RadioMap is an abstract class")
+        raise NotImplementedError("The default add_paths requires _path_weight")
 
     def _scatter_path_gain(
         self,

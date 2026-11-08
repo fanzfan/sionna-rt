@@ -77,6 +77,25 @@ def radio_map_solver_and_scene():
     scene.add(Transmitter(name="tx", position=mi.Point3f(0.0, 0.0, 10.0)))
     return RadioMapSolver(), scene
 
+
+def test_radio_map_subclass_with_own_add_paths(radio_map_solver_and_scene):
+    """A custom map implementing add_paths can use its own accumulation."""
+    class CustomRadioMap(rt.RadioMap):
+        measurement_surface = None
+        cells_count = 1
+        cell_centers = mi.Point3f(0)
+        path_gain = mi.TensorXf([0.])
+
+        def _compute_normalization_factor(self):
+            return 1.
+
+        def add_paths(self, *args, **kwargs):
+            pass
+
+    _, scene = radio_map_solver_and_scene
+    assert CustomRadioMap(scene).num_tx == 1
+
+
 def test_radio_map_solver_rejects_malformed_precoding_vec(
         radio_map_solver_and_scene):
     solver, scene = radio_map_solver_and_scene
@@ -1636,6 +1655,14 @@ def test_precoding_nearly_cancelling_patterns(batched):
     assert np.all(pg >= 0.)
     np.testing.assert_allclose(pg, expected, rtol=1e-2,
                                atol=1e-3*np.max(expected))
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_precoding_vec_rejects_mismatched_component_shapes(batched):
+    scene = _setup_precoding_scene(1)
+    pair = (mi.TensorXf([1., 0., 0., 0.]), dr.zeros(mi.TensorXf, (2, 2)))
+    with pytest.raises(ValueError, match="shape"):
+        _solve_precoding(scene, [pair] if batched else pair)
 
 
 def test_precoding_vec_invalid_forms():
